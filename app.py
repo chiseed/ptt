@@ -16,7 +16,12 @@ APP_TZ = timezone(timedelta(hours=8))
 DB_PATH = Path(os.getenv("DB_PATH", "waitlist.db"))
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "https://partnerlottery.netlify.app,http://localhost:5500,http://127.0.0.1:5500",
+    ",".join([
+        "https://partnerlottery.netlify.app",
+        "https://partnertake.netlify.app",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+    ]),
 ).split(",")
 
 app = FastAPI(title="Partner Waitlist API", version="1.0.0")
@@ -78,10 +83,6 @@ class RepeatCallResponse(BaseModel):
     message: str
 
 
-# -----------------------------
-# DB helpers
-# -----------------------------
-
 def now_local() -> datetime:
     return datetime.now(APP_TZ)
 
@@ -132,10 +133,6 @@ def init_db() -> None:
 def on_startup() -> None:
     init_db()
 
-
-# -----------------------------
-# Mapping helpers
-# -----------------------------
 
 def row_to_ticket(row: sqlite3.Row, queue_ahead: int = 0) -> TicketResponse:
     return TicketResponse(
@@ -188,9 +185,6 @@ def normalize_phone(phone: str) -> str:
     return "".join(ch for ch in phone.strip() if ch.isdigit()) or phone.strip()
 
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
@@ -198,6 +192,7 @@ def root() -> dict[str, Any]:
         "name": "Partner Waitlist API",
         "date_key": today_key(),
         "docs": "/docs",
+        "allowed_origins": [origin.strip() for origin in ALLOWED_ORIGINS if origin.strip()],
     }
 
 
@@ -369,7 +364,6 @@ def admin_queue() -> list[TicketResponse]:
         return [row_to_ticket(row, queue_ahead=index) for index, row in enumerate(rows)]
 
 
-# Railway will look for PORT
 if __name__ == "__main__":
     import uvicorn
 
