@@ -286,6 +286,7 @@ def manual_add_ticket(payload: ManualTicketRequest) -> TicketResponse:
             ),
         )
         conn.commit()
+
         row = conn.execute("SELECT * FROM tickets WHERE id = ?", (cur.lastrowid,)).fetchone()
         queue_ahead = conn.execute(
             """
@@ -295,6 +296,7 @@ def manual_add_ticket(payload: ManualTicketRequest) -> TicketResponse:
             """,
             (date_key, cur.lastrowid),
         ).fetchone()["cnt"]
+
         return row_to_ticket(row, queue_ahead=int(queue_ahead))
 
 
@@ -316,9 +318,11 @@ def call_next() -> NextCallResponse:
         if not next_row:
             raise HTTPException(status_code=404, detail="目前沒有等待中的客人")
 
+        call_time = now_str()
+
         conn.execute(
             "UPDATE tickets SET status = 'called', called_at = ? WHERE id = ?",
-            (now_str(), next_row["id"]),
+            (call_time, next_row["id"]),
         )
         conn.commit()
 
@@ -339,11 +343,29 @@ def repeat_current_call() -> RepeatCallResponse:
     date_key = today_key()
     with closing(get_conn()) as conn:
         current_row = get_current_call(conn, date_key)
+
         if not current_row:
-            return RepeatCallResponse(current_call=None, message="目前尚未叫號")
+            return RepeatCallResponse(
+                current_call=None,
+                message="目前尚未叫號",
+            )
+
+        repeat_time = now_str()
+
+        conn.execute(
+            "UPDATE tickets SET called_at = ? WHERE id = ?",
+            (repeat_time, current_row["id"]),
+        )
+        conn.commit()
+
+        updated_row = conn.execute(
+            "SELECT * FROM tickets WHERE id = ?",
+            (current_row["id"],),
+        ).fetchone()
+
         return RepeatCallResponse(
-            current_call=row_to_ticket(current_row),
-            message=f"目前叫號：{current_row['no']}",
+            current_call=row_to_ticket(updated_row),
+            message=f"已重新叫號：{updated_row['no']}",
         )
 
 
