@@ -92,8 +92,7 @@ def today_key() -> str:
 
 
 def now_str() -> str:
-    return now_local().strftime("%Y-%m-%d %H:%M:%S")
-
+    return now_local().isoformat(timespec="milliseconds")
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
