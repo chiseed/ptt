@@ -56,6 +56,7 @@ class TicketResponse(BaseModel):
     status: str
     source: str
     created_at: str
+    called_at: Optional[str] = None
     queue_ahead: int = 0
 
 
@@ -143,6 +144,7 @@ def row_to_ticket(row: sqlite3.Row, queue_ahead: int = 0) -> TicketResponse:
         status=row["status"],
         source=row["source"],
         created_at=row["created_at"],
+        called_at=row["called_at"],
         queue_ahead=queue_ahead,
     )
 
