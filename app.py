@@ -16,12 +16,7 @@ APP_TZ = timezone(timedelta(hours=8))
 DB_PATH = Path(os.getenv("DB_PATH", "waitlist.db"))
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    ",".join([
-        "https://partnerlottery.netlify.app",
-        "https://partnertake.netlify.app",
-        "http://localhost:5500",
-        "http://127.0.0.1:5500",
-    ]),
+    "https://partnerlottery.netlify.app,http://localhost:5500,http://127.0.0.1:5500",
 ).split(",")
 
 app = FastAPI(title="Partner Waitlist API", version="1.0.0")
@@ -84,6 +79,10 @@ class RepeatCallResponse(BaseModel):
     message: str
 
 
+# -----------------------------
+# DB helpers
+# -----------------------------
+
 def now_local() -> datetime:
     return datetime.now(APP_TZ)
 
@@ -93,7 +92,8 @@ def today_key() -> str:
 
 
 def now_str() -> str:
-    return now_local().isoformat(timespec="milliseconds")
+    return now_local().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -124,6 +124,12 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_tickets_date_phone
             ON tickets(date_key, phone);
+
+            CREATE TABLE IF NOT EXISTS ticket_counters (
+                date_key TEXT PRIMARY KEY,
+                last_no INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         conn.commit()
@@ -133,6 +139,10 @@ def init_db() -> None:
 def on_startup() -> None:
     init_db()
 
+
+# -----------------------------
+# Mapping helpers
+# -----------------------------
 
 def row_to_ticket(row: sqlite3.Row, queue_ahead: int = 0) -> TicketResponse:
     return TicketResponse(
@@ -175,17 +185,46 @@ def get_waiting_rows(conn: sqlite3.Connection, date_key: str) -> list[sqlite3.Ro
 
 
 def get_next_number(conn: sqlite3.Connection, date_key: str) -> int:
+    conn.execute("BEGIN IMMEDIATE")
+    row = conn.execute(
+        "SELECT last_no FROM ticket_counters WHERE date_key = ?",
+        (date_key,),
+    ).fetchone()
+
+    if row:
+        no = int(row["last_no"]) + 1
+        conn.execute(
+            """
+            UPDATE ticket_counters
+            SET last_no = ?, updated_at = ?
+            WHERE date_key = ?
+            """,
+            (no, now_str(), date_key),
+        )
+        return no
+
     row = conn.execute(
         "SELECT COALESCE(MAX(no), 0) AS max_no FROM tickets WHERE date_key = ?",
         (date_key,),
     ).fetchone()
-    return int(row["max_no"]) + 1
+    no = int(row["max_no"]) + 1
+    conn.execute(
+        """
+        INSERT INTO ticket_counters (date_key, last_no, updated_at)
+        VALUES (?, ?, ?)
+        """,
+        (date_key, no, now_str()),
+    )
+    return no
 
 
 def normalize_phone(phone: str) -> str:
     return "".join(ch for ch in phone.strip() if ch.isdigit()) or phone.strip()
 
 
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
@@ -193,7 +232,6 @@ def root() -> dict[str, Any]:
         "name": "Partner Waitlist API",
         "date_key": today_key(),
         "docs": "/docs",
-        "allowed_origins": [origin.strip() for origin in ALLOWED_ORIGINS if origin.strip()],
     }
 
 
@@ -287,7 +325,6 @@ def manual_add_ticket(payload: ManualTicketRequest) -> TicketResponse:
             ),
         )
         conn.commit()
-
         row = conn.execute("SELECT * FROM tickets WHERE id = ?", (cur.lastrowid,)).fetchone()
         queue_ahead = conn.execute(
             """
@@ -297,7 +334,6 @@ def manual_add_ticket(payload: ManualTicketRequest) -> TicketResponse:
             """,
             (date_key, cur.lastrowid),
         ).fetchone()["cnt"]
-
         return row_to_ticket(row, queue_ahead=int(queue_ahead))
 
 
@@ -319,11 +355,9 @@ def call_next() -> NextCallResponse:
         if not next_row:
             raise HTTPException(status_code=404, detail="目前沒有等待中的客人")
 
-        call_time = now_str()
-
         conn.execute(
             "UPDATE tickets SET status = 'called', called_at = ? WHERE id = ?",
-            (call_time, next_row["id"]),
+            (now_str(), next_row["id"]),
         )
         conn.commit()
 
@@ -344,29 +378,11 @@ def repeat_current_call() -> RepeatCallResponse:
     date_key = today_key()
     with closing(get_conn()) as conn:
         current_row = get_current_call(conn, date_key)
-
         if not current_row:
-            return RepeatCallResponse(
-                current_call=None,
-                message="目前尚未叫號",
-            )
-
-        repeat_time = now_str()
-
-        conn.execute(
-            "UPDATE tickets SET called_at = ? WHERE id = ?",
-            (repeat_time, current_row["id"]),
-        )
-        conn.commit()
-
-        updated_row = conn.execute(
-            "SELECT * FROM tickets WHERE id = ?",
-            (current_row["id"],),
-        ).fetchone()
-
+            return RepeatCallResponse(current_call=None, message="目前尚未叫號")
         return RepeatCallResponse(
-            current_call=row_to_ticket(updated_row),
-            message=f"已重新叫號：{updated_row['no']}",
+            current_call=row_to_ticket(current_row),
+            message=f"目前叫號：{current_row['no']}",
         )
 
 
@@ -374,9 +390,11 @@ def repeat_current_call() -> RepeatCallResponse:
 def clear_today() -> BasicResponse:
     date_key = today_key()
     with closing(get_conn()) as conn:
-        conn.execute("DELETE FROM tickets WHERE date_key = ?", (date_key,))
+        conn.execute("BEGIN IMMEDIATE")
+        deleted = conn.execute("DELETE FROM tickets WHERE date_key = ?", (date_key,)).rowcount
+        conn.execute("DELETE FROM ticket_counters WHERE date_key = ?", (date_key,))
         conn.commit()
-    return BasicResponse(message="今日資料已清空")
+    return BasicResponse(message=f"今日資料已清空，已刪除 {deleted} 筆，下一號將從 1 開始")
 
 
 @app.get("/api/admin/queue", response_model=list[TicketResponse])
@@ -387,6 +405,7 @@ def admin_queue() -> list[TicketResponse]:
         return [row_to_ticket(row, queue_ahead=index) for index, row in enumerate(rows)]
 
 
+# Railway will look for PORT
 if __name__ == "__main__":
     import uvicorn
 
