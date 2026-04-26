@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import os
-import secrets
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,19 +14,18 @@ from pydantic import BaseModel, Field
 
 APP_TZ = timezone(timedelta(hours=8))
 DB_PATH = Path(os.getenv("DB_PATH", "waitlist.db"))
+DEPLOY_MARK = "ptt-app-counter-reset-20260427-0145"
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    ",".join(
-        [
-            "https://partnerlottery.netlify.app",
-            "https://partnertake.netlify.app",
-            "http://localhost:5500",
-            "http://127.0.0.1:5500",
-        ]
-    ),
+    ",".join([
+        "https://partnerlottery.netlify.app",
+        "https://partnertake.netlify.app",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+    ]),
 ).split(",")
 
-app = FastAPI(title="Partner Waitlist API", version="1.1.0")
+app = FastAPI(title="Partner Waitlist API", version="1.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,17 +85,9 @@ class RepeatCallResponse(BaseModel):
     message: str
 
 
-class EntryTokenResponse(BaseModel):
-    ok: bool = True
-    day: str
-    token: str
-
-
-class ValidateEntryResponse(BaseModel):
-    ok: bool = True
-    valid: bool
-    day: str
-
+# -----------------------------
+# DB helpers
+# -----------------------------
 
 def now_local() -> datetime:
     return datetime.now(APP_TZ)
@@ -138,19 +128,13 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_tickets_date_status_id
             ON tickets(date_key, status, id);
 
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_date_phone_unique
+            CREATE INDEX IF NOT EXISTS idx_tickets_date_phone
             ON tickets(date_key, phone);
 
             CREATE TABLE IF NOT EXISTS ticket_counters (
                 date_key TEXT PRIMARY KEY,
                 last_no INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS entry_tokens (
-                date_key TEXT PRIMARY KEY,
-                token TEXT NOT NULL,
-                created_at TEXT NOT NULL
             );
             """
         )
@@ -160,7 +144,16 @@ def init_db() -> None:
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    print(
+        f"[{DEPLOY_MARK}] startup file={Path(__file__).resolve()} "
+        f"db={DB_PATH.resolve()} date_key={today_key()}",
+        flush=True,
+    )
 
+
+# -----------------------------
+# Mapping helpers
+# -----------------------------
 
 def row_to_ticket(row: sqlite3.Row, queue_ahead: int = 0) -> TicketResponse:
     return TicketResponse(
@@ -240,34 +233,31 @@ def normalize_phone(phone: str) -> str:
     return "".join(ch for ch in phone.strip() if ch.isdigit()) or phone.strip()
 
 
-def get_or_create_entry_token(conn: sqlite3.Connection, date_key: str) -> str:
-    row = conn.execute(
-        "SELECT token FROM entry_tokens WHERE date_key = ?",
-        (date_key,),
-    ).fetchone()
-    if row:
-        return str(row["token"])
-
-    token = secrets.token_urlsafe(24)
-    conn.execute(
-        """
-        INSERT INTO entry_tokens (date_key, token, created_at)
-        VALUES (?, ?, ?)
-        """,
-        (date_key, token, now_str()),
-    )
-    conn.commit()
-    return token
-
-
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
         "ok": True,
         "name": "Partner Waitlist API",
-        "version": "1.1.0",
+        "version": "1.1.1",
+        "deploy_mark": DEPLOY_MARK,
         "date_key": today_key(),
+        "db_path": str(DB_PATH),
         "docs": "/docs",
+    }
+
+
+@app.get("/api/_debug")
+def api_debug() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "deploy_mark": DEPLOY_MARK,
+        "file": str(Path(__file__).resolve()),
+        "db_path": str(DB_PATH.resolve()),
+        "date_key": today_key(),
+        "routes": sorted(route.path for route in app.routes),
     }
 
 
@@ -291,34 +281,6 @@ def api_status() -> StatusResponse:
         )
 
 
-@app.get("/api/queue/entry-token", response_model=EntryTokenResponse)
-def entry_token() -> EntryTokenResponse:
-    date_key = today_key()
-    with closing(get_conn()) as conn:
-        token = get_or_create_entry_token(conn, date_key)
-    return EntryTokenResponse(day=date_key, token=token)
-
-
-@app.get("/api/queue/validate-entry", response_model=ValidateEntryResponse)
-def validate_entry(day: str, token: str) -> ValidateEntryResponse:
-    current_day = today_key()
-    if day != current_day:
-        return ValidateEntryResponse(valid=False, day=current_day)
-
-    with closing(get_conn()) as conn:
-        row = conn.execute(
-            """
-            SELECT token
-            FROM entry_tokens
-            WHERE date_key = ?
-            """,
-            (day,),
-        ).fetchone()
-
-    valid = bool(row and secrets.compare_digest(str(row["token"]), token))
-    return ValidateEntryResponse(valid=valid, day=current_day)
-
-
 @app.post("/api/tickets", response_model=TicketResponse)
 def take_ticket(payload: TakeTicketRequest) -> TicketResponse:
     date_key = today_key()
@@ -337,26 +299,22 @@ def take_ticket(payload: TakeTicketRequest) -> TicketResponse:
         if duplicated:
             raise HTTPException(status_code=409, detail="這支電話今天已取過號")
 
-        try:
-            no = get_next_number(conn, date_key)
-            cur = conn.execute(
-                """
-                INSERT INTO tickets (date_key, no, surname, party_size, phone, status, source, created_at)
-                VALUES (?, ?, ?, ?, ?, 'waiting', 'customer', ?)
-                """,
-                (
-                    date_key,
-                    no,
-                    payload.surname.strip(),
-                    payload.party_size,
-                    phone,
-                    now_str(),
-                ),
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            conn.rollback()
-            raise HTTPException(status_code=409, detail="這支電話今天已取過號")
+        no = get_next_number(conn, date_key)
+        cur = conn.execute(
+            """
+            INSERT INTO tickets (date_key, no, surname, party_size, phone, status, source, created_at)
+            VALUES (?, ?, ?, ?, ?, 'waiting', 'customer', ?)
+            """,
+            (
+                date_key,
+                no,
+                payload.surname.strip(),
+                payload.party_size,
+                phone,
+                now_str(),
+            ),
+        )
+        conn.commit()
 
         row = conn.execute("SELECT * FROM tickets WHERE id = ?", (cur.lastrowid,)).fetchone()
         queue_ahead = conn.execute(
@@ -393,7 +351,6 @@ def manual_add_ticket(payload: ManualTicketRequest) -> TicketResponse:
             ),
         )
         conn.commit()
-
         row = conn.execute("SELECT * FROM tickets WHERE id = ?", (cur.lastrowid,)).fetchone()
         queue_ahead = conn.execute(
             """
@@ -403,7 +360,6 @@ def manual_add_ticket(payload: ManualTicketRequest) -> TicketResponse:
             """,
             (date_key, cur.lastrowid),
         ).fetchone()["cnt"]
-
         return row_to_ticket(row, queue_ahead=int(queue_ahead))
 
 
@@ -433,11 +389,7 @@ def call_next() -> NextCallResponse:
 
         called_row = conn.execute("SELECT * FROM tickets WHERE id = ?", (next_row["id"],)).fetchone()
         waiting_count = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM tickets
-            WHERE date_key = ? AND status = 'waiting'
-            """,
+            "SELECT COUNT(*) AS cnt FROM tickets WHERE date_key = ? AND status = 'waiting'",
             (date_key,),
         ).fetchone()["cnt"]
 
@@ -454,21 +406,9 @@ def repeat_current_call() -> RepeatCallResponse:
         current_row = get_current_call(conn, date_key)
         if not current_row:
             return RepeatCallResponse(current_call=None, message="目前尚未叫號")
-
-        conn.execute(
-            "UPDATE tickets SET called_at = ? WHERE id = ?",
-            (now_str(), current_row["id"]),
-        )
-        conn.commit()
-
-        updated_row = conn.execute(
-            "SELECT * FROM tickets WHERE id = ?",
-            (current_row["id"],),
-        ).fetchone()
-
         return RepeatCallResponse(
-            current_call=row_to_ticket(updated_row),
-            message=f"已重新叫號：{updated_row['no']}",
+            current_call=row_to_ticket(current_row),
+            message=f"目前叫號：{current_row['no']}",
         )
 
 
@@ -479,9 +419,7 @@ def clear_today() -> BasicResponse:
         conn.execute("BEGIN IMMEDIATE")
         deleted = conn.execute("DELETE FROM tickets WHERE date_key = ?", (date_key,)).rowcount
         conn.execute("DELETE FROM ticket_counters WHERE date_key = ?", (date_key,))
-        conn.execute("DELETE FROM entry_tokens WHERE date_key = ?", (date_key,))
         conn.commit()
-
     return BasicResponse(message=f"今日資料已清空，已刪除 {deleted} 筆，下一號將從 1 開始")
 
 
@@ -493,6 +431,7 @@ def admin_queue() -> list[TicketResponse]:
         return [row_to_ticket(row, queue_ahead=index) for index, row in enumerate(rows)]
 
 
+# Railway will look for PORT
 if __name__ == "__main__":
     import uvicorn
 
