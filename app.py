@@ -48,6 +48,11 @@ class ManualTicketRequest(BaseModel):
     phone: str = Field(min_length=1, max_length=30)
 
 
+class CustomerPartySizeUpdateRequest(BaseModel):
+    party_size: int = Field(ge=1, le=20)
+    phone: str = Field(min_length=1, max_length=30)
+
+
 class TicketResponse(BaseModel):
     id: int
     no: int
@@ -327,6 +332,45 @@ def take_ticket(payload: TakeTicketRequest) -> TicketResponse:
         ).fetchone()["cnt"]
 
         return row_to_ticket(row, queue_ahead=int(queue_ahead))
+
+
+@app.patch("/api/tickets/{ticket_no}/party-size", response_model=TicketResponse)
+def update_customer_party_size(ticket_no: int, payload: CustomerPartySizeUpdateRequest) -> TicketResponse:
+    date_key = today_key()
+    phone = normalize_phone(payload.phone)
+
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM tickets
+            WHERE date_key = ? AND no = ? AND phone = ?
+            LIMIT 1
+            """,
+            (date_key, ticket_no, phone),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="找不到可修改的票號")
+        if row["status"] != "waiting":
+            raise HTTPException(status_code=409, detail="已叫號後無法修改人數")
+
+        conn.execute(
+            "UPDATE tickets SET party_size = ? WHERE id = ?",
+            (payload.party_size, row["id"]),
+        )
+        conn.commit()
+
+        updated_row = conn.execute("SELECT * FROM tickets WHERE id = ?", (row["id"],)).fetchone()
+        queue_ahead = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM tickets
+            WHERE date_key = ? AND status = 'waiting' AND id < ?
+            """,
+            (date_key, row["id"]),
+        ).fetchone()["cnt"]
+
+        return row_to_ticket(updated_row, queue_ahead=int(queue_ahead))
 
 
 @app.post("/api/admin/tickets", response_model=TicketResponse)
