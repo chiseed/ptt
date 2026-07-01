@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 APP_TZ = timezone(timedelta(hours=8))
 DB_PATH = Path(os.getenv("DB_PATH", "waitlist.db"))
-DEPLOY_MARK = "ptt-app-counter-reset-20260427-0145"
+DEPLOY_MARK = "ptt-fixed-qr-ticket-lookup-20260701-1025"
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     ",".join([
@@ -88,6 +88,11 @@ class RepeatCallResponse(BaseModel):
     ok: bool = True
     current_call: Optional[TicketResponse]
     message: str
+
+
+class TicketLookupResponse(BaseModel):
+    ok: bool = True
+    ticket: Optional[TicketResponse] = None
 
 
 # -----------------------------
@@ -332,6 +337,37 @@ def take_ticket(payload: TakeTicketRequest) -> TicketResponse:
         ).fetchone()["cnt"]
 
         return row_to_ticket(row, queue_ahead=int(queue_ahead))
+
+
+@app.get("/api/tickets/{ticket_no}", response_model=TicketLookupResponse)
+def get_ticket(ticket_no: int) -> TicketLookupResponse:
+    date_key = today_key()
+
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM tickets
+            WHERE date_key = ? AND no = ?
+            LIMIT 1
+            """,
+            (date_key, ticket_no),
+        ).fetchone()
+        if not row:
+            return TicketLookupResponse(ticket=None)
+
+        queue_ahead = 0
+        if row["status"] == "waiting":
+            queue_ahead = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM tickets
+                WHERE date_key = ? AND status = 'waiting' AND id < ?
+                """,
+                (date_key, row["id"]),
+            ).fetchone()["cnt"]
+
+        return TicketLookupResponse(ticket=row_to_ticket(row, queue_ahead=int(queue_ahead)))
 
 
 @app.patch("/api/tickets/{ticket_no}/party-size", response_model=TicketResponse)
